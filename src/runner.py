@@ -1,4 +1,12 @@
-"""Top-level orchestration: download data → classical → quantum → save → plot → print."""
+"""Top-level orchestration: download → classical → quantum → save → plot → print.
+
+Results are written **incrementally**: every time a new row is produced
+(classical, benchmark, or any quantum solver) we re-write
+``comparison_summary.csv`` and ``comparison_summary.json`` so a SLURM
+time-limit kill never loses partial progress. ``quantum_samples.csv`` and
+``quantum_discrete_weight_results.csv`` are also written as soon as their
+data exists, not deferred to the end.
+"""
 
 from __future__ import annotations
 
@@ -33,6 +41,10 @@ RISK_DISCLAIMER = (
     "  4. This tool is for research/education only and is NOT investment advice."
 )
 
+QUANTUM_SAMPLES_COLUMNS = (
+    "solver", "bitstring", "selected_weight_index", "btc_weight", "objective", "probability",
+)
+
 
 def _quantum_solvers_for(config: Config) -> list[str]:
     if config.quantum_solver == "all":
@@ -40,92 +52,21 @@ def _quantum_solvers_for(config: Config) -> list[str]:
     return [config.quantum_solver]
 
 
-def _run_quantum(
-    config: Config,
-    market: MarketData,
-    log: logging.Logger,
-) -> tuple[list[dict], pd.DataFrame, pd.DataFrame, dict[str, float | None]]:
-    """Run all enabled quantum solvers; collect rows + samples + candidates df.
+def _flush_summary(rows: list[dict], output_dir: Path) -> None:
+    """Re-write comparison_summary.csv + .json from current rows. Called after each new row."""
+    if not rows:
+        return
+    summary = assemble_summary(rows)
+    save_summary(summary, output_dir)
 
-    Returns:
-        rows: list of result dicts (one per (mode, solver) combination).
-        candidates_df: pre-evaluated discrete candidates (empty if discrete disabled).
-        samples_df: top-k QAOA/SamplingVQE samples (empty if no approx solver ran).
-        landmarks: best btc weights for plotting (classical_grid, qaoa_discrete).
-    """
-    rows: list[dict] = []
-    samples_all: list[pd.DataFrame] = []
-    candidates_df = pd.DataFrame()
-    landmarks: dict[str, float | None] = {"qaoa_discrete_btc": None}
 
-    if not config.use_quantum:
-        return rows, candidates_df, pd.DataFrame(), landmarks
-
-    if not qc.QISKIT_AVAILABLE:
-        log.warning(
-            "Qiskit is not importable; skipping quantum runs. Install qiskit + qiskit-optimization "
-            "+ qiskit-algorithms (and qiskit-aer for QAOA shots) to enable."
-        )
-        return rows, candidates_df, pd.DataFrame(), landmarks
-
-    log.info("Qiskit availability: %s", qc.availability_summary())
-
-    do_binary = config.quantum_mode in ("binary", "both")
-    do_discrete = config.quantum_mode in ("discrete", "both")
-    solvers = _quantum_solvers_for(config)
-
-    if do_binary:
-        for solver in solvers:
-            if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
-                log.info("Skipping binary sampling_vqe — not available in installed Qiskit.")
-                continue
-            log.info("Running quantum binary selection [%s]...", solver)
-            row = solve_binary(
-                market.returns, market.mu, market.Sigma,
-                solver=solver,
-                risk_aversion=config.risk_aversion,
-                risk_free_rate=config.risk_free_rate,
-                budget=config.binary_budget,
-                no_budget_constraint=config.no_budget_constraint,
-                qaoa_reps=config.qaoa_reps,
-                qaoa_shots=config.qaoa_shots,
-                qaoa_seed=config.qaoa_seed,
-            )
-            rows.append(row)
-
-    if do_discrete:
-        candidates_df = build_candidates(
-            market.mu, market.Sigma, market.returns,
-            weight_step=config.quantum_weight_step,
-            risk_aversion=config.risk_aversion,
-            risk_free_rate=config.risk_free_rate,
-        )
-        log.info(
-            "Built %d candidate weights with step=%.4f for discrete-weight QUBO.",
-            len(candidates_df), config.quantum_weight_step,
-        )
-        for solver in solvers:
-            if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
-                log.info("Skipping discrete sampling_vqe — not available in installed Qiskit.")
-                continue
-            log.info("Running quantum discrete weights [%s]...", solver)
-            row, samples = solve_discrete(
-                market.returns, market.mu, market.Sigma, candidates_df,
-                solver=solver,
-                risk_aversion=config.risk_aversion,
-                risk_free_rate=config.risk_free_rate,
-                qaoa_reps=config.qaoa_reps,
-                qaoa_shots=config.qaoa_shots,
-                qaoa_seed=config.qaoa_seed,
-            )
-            rows.append(row)
-            if not samples.empty:
-                samples_all.append(samples)
-            if solver == "qaoa" and row.get("success") and pd.notna(row.get("btc_weight")):
-                landmarks["qaoa_discrete_btc"] = float(row["btc_weight"])
-
-    samples_df = pd.concat(samples_all, ignore_index=True) if samples_all else pd.DataFrame()
-    return rows, candidates_df, samples_df, landmarks
+def _flush_samples(samples_dfs: list[pd.DataFrame], output_dir: Path) -> None:
+    """Re-write quantum_samples.csv from accumulated sample frames."""
+    path = output_dir / "quantum_samples.csv"
+    if samples_dfs:
+        pd.concat(samples_dfs, ignore_index=True).to_csv(path, index=False)
+    elif not path.exists():
+        pd.DataFrame(columns=list(QUANTUM_SAMPLES_COLUMNS)).to_csv(path, index=False)
 
 
 def _print_summary(market: MarketData, summary: pd.DataFrame, output_dir: Path, log: logging.Logger) -> None:
@@ -184,7 +125,12 @@ def _print_summary(market: MarketData, summary: pd.DataFrame, output_dir: Path, 
 
 
 def run(config: Config) -> int:
-    """End-to-end. Returns shell-style exit code."""
+    """End-to-end. Returns shell-style exit code.
+
+    All output files are flushed incrementally so a job kill (SLURM time
+    limit, OOM, Ctrl-C) at any point still leaves consistent partial state
+    on disk: every completed row is already in ``comparison_summary.csv``.
+    """
     config.validate()
     log = setup_logger(config.verbose)
     set_random_seed(config.qaoa_seed)
@@ -209,6 +155,15 @@ def run(config: Config) -> int:
     with open(output_dir / "basic_stats.json", "w", encoding="utf-8") as fh:
         json.dump(to_jsonable(market.basic_stats()), fh, indent=2, ensure_ascii=False)
 
+    rows: list[dict] = []
+    samples_dfs: list[pd.DataFrame] = []
+    candidates_df = pd.DataFrame()
+    landmarks: dict[str, float | None] = {"qaoa_discrete_btc": None}
+
+    # Always create an empty placeholder so downstream tooling sees a stable schema
+    _flush_samples(samples_dfs, output_dir)
+
+    # ---- 1. Classical grid (cheap; flush so we have something even if next step crashes)
     log.info("Running classical grid search...")
     grid, classic_grid_row = grid_search(
         market.returns, market.mu, market.Sigma,
@@ -219,7 +174,10 @@ def run(config: Config) -> int:
         max_drawdown=config.max_drawdown,
     )
     grid.to_csv(output_dir / "grid_search_results.csv", index=False)
+    rows.append(classic_grid_row)
+    _flush_summary(rows, output_dir)
 
+    # ---- 2. Mean-Variance
     log.info("Running mean-variance optimization...")
     mv_row = mean_variance_optimize(
         market.returns, market.mu, market.Sigma,
@@ -227,50 +185,116 @@ def run(config: Config) -> int:
         risk_free_rate=config.risk_free_rate,
         risk_aversion=config.risk_aversion,
     )
+    rows.append(mv_row)
+    _flush_summary(rows, output_dir)
 
+    # ---- 3. Benchmarks (cheap; useful baselines even if quantum dies)
     log.info("Evaluating benchmarks...")
     benchmark_rows = evaluate_benchmarks(
         market.returns, market.mu, market.Sigma,
         risk_free_rate=config.risk_free_rate,
         risk_aversion=config.risk_aversion,
     )
+    rows.extend(benchmark_rows)
+    _flush_summary(rows, output_dir)
 
-    quantum_rows, candidates_df, samples_df, landmarks = _run_quantum(config, market, log)
-    if not candidates_df.empty:
-        candidates_df.to_csv(output_dir / "quantum_discrete_weight_results.csv", index=False)
-    if not samples_df.empty:
-        samples_df.to_csv(output_dir / "quantum_samples.csv", index=False)
-    elif (output_dir / "quantum_samples.csv").exists() is False:
-        # always create an empty placeholder for stable schema
-        pd.DataFrame(
-            columns=["solver", "bitstring", "selected_weight_index", "btc_weight", "objective", "probability"]
-        ).to_csv(output_dir / "quantum_samples.csv", index=False)
+    # ---- 4. Quantum (slow; each solver flushes immediately on completion)
+    if config.use_quantum:
+        if not qc.QISKIT_AVAILABLE:
+            log.warning(
+                "Qiskit is not importable; skipping quantum runs. Install qiskit + "
+                "qiskit-optimization + qiskit-algorithms (and qiskit-aer for QAOA "
+                "shots) to enable."
+            )
+        else:
+            log.info("Qiskit availability: %s", qc.availability_summary())
+            do_binary = config.quantum_mode in ("binary", "both")
+            do_discrete = config.quantum_mode in ("discrete", "both")
+            solvers = _quantum_solvers_for(config)
 
-    all_rows = [classic_grid_row, mv_row, *quantum_rows, *benchmark_rows]
-    summary = assemble_summary(all_rows)
-    save_summary(summary, output_dir)
+            if do_binary:
+                for solver in solvers:
+                    if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
+                        log.info("Skipping binary sampling_vqe — not available in installed Qiskit.")
+                        continue
+                    log.info("Running quantum binary selection [%s]...", solver)
+                    row = solve_binary(
+                        market.returns, market.mu, market.Sigma,
+                        solver=solver,
+                        risk_aversion=config.risk_aversion,
+                        risk_free_rate=config.risk_free_rate,
+                        budget=config.binary_budget,
+                        no_budget_constraint=config.no_budget_constraint,
+                        qaoa_reps=config.qaoa_reps,
+                        qaoa_shots=config.qaoa_shots,
+                        qaoa_seed=config.qaoa_seed,
+                    )
+                    rows.append(row)
+                    _flush_summary(rows, output_dir)
+
+            if do_discrete:
+                # Pre-compute every candidate weight + its objective. Persist
+                # immediately so a kill during the QUBO solve doesn't lose this.
+                candidates_df = build_candidates(
+                    market.mu, market.Sigma, market.returns,
+                    weight_step=config.quantum_weight_step,
+                    risk_aversion=config.risk_aversion,
+                    risk_free_rate=config.risk_free_rate,
+                )
+                candidates_df.to_csv(
+                    output_dir / "quantum_discrete_weight_results.csv", index=False,
+                )
+                log.info(
+                    "Built %d candidate weights with step=%.4f for discrete-weight QUBO.",
+                    len(candidates_df), config.quantum_weight_step,
+                )
+
+                for solver in solvers:
+                    if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
+                        log.info("Skipping discrete sampling_vqe — not available in installed Qiskit.")
+                        continue
+                    log.info("Running quantum discrete weights [%s]...", solver)
+                    row, samples = solve_discrete(
+                        market.returns, market.mu, market.Sigma, candidates_df,
+                        solver=solver,
+                        risk_aversion=config.risk_aversion,
+                        risk_free_rate=config.risk_free_rate,
+                        qaoa_reps=config.qaoa_reps,
+                        qaoa_shots=config.qaoa_shots,
+                        qaoa_seed=config.qaoa_seed,
+                    )
+                    rows.append(row)
+                    _flush_summary(rows, output_dir)
+                    if not samples.empty:
+                        samples_dfs.append(samples)
+                        _flush_samples(samples_dfs, output_dir)
+                    if solver == "qaoa" and row.get("success") and pd.notna(row.get("btc_weight")):
+                        landmarks["qaoa_discrete_btc"] = float(row["btc_weight"])
+
+    # ---- 5. Plots (last; failure here doesn't lose any data)
+    samples_df = pd.concat(samples_dfs, ignore_index=True) if samples_dfs else pd.DataFrame()
+    summary = assemble_summary(rows)
+    classic_best = best_classical_row(summary)
 
     optimized_selections: list[tuple[str, np.ndarray]] = []
-    classic_best = best_classical_row(summary)
     if classic_best is not None and pd.notna(classic_best["btc_weight"]):
         optimized_selections.append((
             f"Classical best ({classic_best['method']})",
             np.array([classic_best["btc_weight"], classic_best["bnb_weight"]], dtype=float),
         ))
-    if quantum_rows:
-        # pick best successful quantum discrete row for the cumulative chart
-        q_disc = [
-            r for r in quantum_rows
-            if r.get("success")
-            and r.get("method", "").startswith("Quantum Discrete")
-            and pd.notna(r.get("btc_weight"))
-        ]
-        if q_disc:
-            best_q = max(q_disc, key=lambda r: r.get("sharpe_ratio") or float("-inf"))
-            optimized_selections.append((
-                f"Quantum discrete best ({best_q['solver']})",
-                np.array([best_q["btc_weight"], best_q["bnb_weight"]], dtype=float),
-            ))
+    quantum_rows = [r for r in rows if str(r.get("method", "")).startswith("Quantum")]
+    q_disc = [
+        r for r in quantum_rows
+        if r.get("success")
+        and r.get("method", "").startswith("Quantum Discrete")
+        and pd.notna(r.get("btc_weight"))
+    ]
+    if q_disc:
+        best_q = max(q_disc, key=lambda r: r.get("sharpe_ratio") or float("-inf"))
+        optimized_selections.append((
+            f"Quantum discrete best ({best_q['solver']})",
+            np.array([best_q["btc_weight"], best_q["bnb_weight"]], dtype=float),
+        ))
     optimized_selections.extend([
         ("Benchmark 100% BTC", np.array([1.0, 0.0])),
         ("Benchmark 100% BNB", np.array([0.0, 1.0])),
