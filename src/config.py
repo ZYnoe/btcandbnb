@@ -54,6 +54,10 @@ class Config:
     binary_budget: int = 1
     no_budget_constraint: bool = False
 
+    # parallelism
+    workers: int = 0  # 0 → auto-detect (SLURM_CPUS_PER_TASK or cpu_count//2)
+    parallel_smoke_test: bool = False
+
     # misc
     no_plots: bool = False
     save_intermediate: bool = False
@@ -86,6 +90,8 @@ class Config:
             raise ValueError(f"--qaoa-shots must be >= 1, got {self.qaoa_shots}")
         if self.annualization_factor <= 0:
             raise ValueError("--annualization-factor must be positive")
+        if self.workers < 0 or self.workers > 64:
+            raise ValueError(f"--workers must be in [0, 64], got {self.workers}")
 
     @property
     def output_path(self) -> Path:

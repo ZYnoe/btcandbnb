@@ -61,6 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--binary-budget", type=int, choices=(1, 2), default=1)
     p.add_argument("--no-budget-constraint", action="store_true")
 
+    # parallelism
+    p.add_argument(
+        "--workers", type=int, default=0,
+        help="Process-pool size for independent quantum solvers. "
+             "0 = auto-detect (SLURM_CPUS_PER_TASK or cpu_count//2).",
+    )
+    p.add_argument(
+        "--parallel-smoke-test", action="store_true",
+        help="Run a CPU-bound multiprocessing smoke test (4 tasks × ~25s) "
+             "and exit. Use this to verify SLURM + multiprocessing actually "
+             "saturate the allocated cores before relying on parallel runs.",
+    )
+
     # misc
     p.add_argument("--no-plots", action="store_true")
     p.add_argument("--save-intermediate", action="store_true",
@@ -72,6 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Parallel smoke test short-circuits everything else — its purpose is to
+    # verify that SLURM + multiprocessing can saturate the allocated cores
+    # *before* the user trusts a real parallel run.
+    if args.parallel_smoke_test:
+        from src.parallel import compute_workers, print_parallelism_report, run_smoke_test
+        workers = compute_workers(args.workers)
+        print_parallelism_report(args.workers, workers)
+        return run_smoke_test(workers=workers)
+
     config = Config(
         start=args.start,
         end=args.end,
@@ -93,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         qaoa_seed=args.qaoa_seed,
         binary_budget=args.binary_budget,
         no_budget_constraint=args.no_budget_constraint,
+        workers=args.workers,
+        parallel_smoke_test=args.parallel_smoke_test,
         no_plots=args.no_plots,
         save_intermediate=args.save_intermediate,
         verbose=args.verbose,

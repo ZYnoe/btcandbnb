@@ -27,9 +27,14 @@ from .comparison import (
 from .config import Config
 from .data import compute_market_data, MarketData
 from .optimizer import evaluate_benchmarks, grid_search, mean_variance_optimize
+from .parallel import (
+    compute_workers,
+    print_parallelism_report,
+    quantum_worker,
+    run_quantum_parallel,
+)
 from .plots import make_all_plots
-from .quantum_binary import solve_binary
-from .quantum_discrete_weights import build_candidates, solve_discrete
+from .quantum_discrete_weights import build_candidates
 from .utils import ensure_dir, set_random_seed, setup_logger, to_jsonable
 
 RISK_DISCLAIMER = (
@@ -136,6 +141,11 @@ def run(config: Config) -> int:
     set_random_seed(config.qaoa_seed)
     output_dir = ensure_dir(config.output_path)
 
+    # Resolve the worker count and emit a diagnostic banner *before* any work,
+    # so the SLURM .out file always shows what parallelism we actually got.
+    workers = compute_workers(config.workers)
+    print_parallelism_report(config.workers, workers)
+
     log.info("Downloading market data for %s ...", ", ".join(config.tickers))
     try:
         market = compute_market_data(
@@ -198,7 +208,7 @@ def run(config: Config) -> int:
     rows.extend(benchmark_rows)
     _flush_summary(rows, output_dir)
 
-    # ---- 4. Quantum (slow; each solver flushes immediately on completion)
+    # ---- 4. Quantum (slow; the only place worth parallelizing in this codebase)
     if config.use_quantum:
         if not qc.QISKIT_AVAILABLE:
             log.warning(
@@ -212,29 +222,10 @@ def run(config: Config) -> int:
             do_discrete = config.quantum_mode in ("discrete", "both")
             solvers = _quantum_solvers_for(config)
 
-            if do_binary:
-                for solver in solvers:
-                    if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
-                        log.info("Skipping binary sampling_vqe — not available in installed Qiskit.")
-                        continue
-                    log.info("Running quantum binary selection [%s]...", solver)
-                    row = solve_binary(
-                        market.returns, market.mu, market.Sigma,
-                        solver=solver,
-                        risk_aversion=config.risk_aversion,
-                        risk_free_rate=config.risk_free_rate,
-                        budget=config.binary_budget,
-                        no_budget_constraint=config.no_budget_constraint,
-                        qaoa_reps=config.qaoa_reps,
-                        qaoa_shots=config.qaoa_shots,
-                        qaoa_seed=config.qaoa_seed,
-                    )
-                    rows.append(row)
-                    _flush_summary(rows, output_dir)
-
+            # If discrete is requested, pre-compute candidates ONCE in the
+            # parent. Workers receive a copy via the pickled payload —
+            # cheaper than re-evaluating per worker.
             if do_discrete:
-                # Pre-compute every candidate weight + its objective. Persist
-                # immediately so a kill during the QUBO solve doesn't lose this.
                 candidates_df = build_candidates(
                     market.mu, market.Sigma, market.returns,
                     weight_step=config.quantum_weight_step,
@@ -249,27 +240,124 @@ def run(config: Config) -> int:
                     len(candidates_df), config.quantum_weight_step,
                 )
 
+            # Build the task list. Each entry is one solver call we want to run.
+            payloads: list[dict] = []
+            if do_binary:
+                for solver in solvers:
+                    if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
+                        log.info("Skipping binary sampling_vqe — not available in installed Qiskit.")
+                        continue
+                    payloads.append({
+                        "kind": "binary",
+                        "solver": solver,
+                        "asset_returns": market.returns,
+                        "mu": market.mu,
+                        "Sigma": market.Sigma,
+                        "risk_aversion": config.risk_aversion,
+                        "risk_free_rate": config.risk_free_rate,
+                        "budget": config.binary_budget,
+                        "no_budget_constraint": config.no_budget_constraint,
+                        "qaoa_reps": config.qaoa_reps,
+                        "qaoa_shots": config.qaoa_shots,
+                        "qaoa_seed": config.qaoa_seed,
+                    })
+            if do_discrete:
                 for solver in solvers:
                     if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
                         log.info("Skipping discrete sampling_vqe — not available in installed Qiskit.")
                         continue
-                    log.info("Running quantum discrete weights [%s]...", solver)
-                    row, samples = solve_discrete(
-                        market.returns, market.mu, market.Sigma, candidates_df,
-                        solver=solver,
-                        risk_aversion=config.risk_aversion,
-                        risk_free_rate=config.risk_free_rate,
-                        qaoa_reps=config.qaoa_reps,
-                        qaoa_shots=config.qaoa_shots,
-                        qaoa_seed=config.qaoa_seed,
-                    )
-                    rows.append(row)
-                    _flush_summary(rows, output_dir)
-                    if not samples.empty:
-                        samples_dfs.append(samples)
-                        _flush_samples(samples_dfs, output_dir)
-                    if solver == "qaoa" and row.get("success") and pd.notna(row.get("btc_weight")):
-                        landmarks["qaoa_discrete_btc"] = float(row["btc_weight"])
+                    payloads.append({
+                        "kind": "discrete",
+                        "solver": solver,
+                        "asset_returns": market.returns,
+                        "mu": market.mu,
+                        "Sigma": market.Sigma,
+                        "candidates": candidates_df,
+                        "risk_aversion": config.risk_aversion,
+                        "risk_free_rate": config.risk_free_rate,
+                        "qaoa_reps": config.qaoa_reps,
+                        "qaoa_shots": config.qaoa_shots,
+                        "qaoa_seed": config.qaoa_seed,
+                    })
+
+            print(f"[parallel] quantum task plan: {len(payloads)} task(s) "
+                  f"({'binary, ' if do_binary else ''}{'discrete' if do_discrete else ''})", flush=True)
+
+            # Side-effect callback: incrementally write summary + samples after
+            # each result, regardless of which worker it came from. Runs in the
+            # parent process, so file writes are naturally serialized.
+            def _on_result(payload: dict, result: dict) -> None:
+                row = result["row"]
+                rows.append(row)
+                _flush_summary(rows, output_dir)
+                samples = result.get("samples")
+                if samples is not None and not samples.empty:
+                    samples_dfs.append(samples)
+                    _flush_samples(samples_dfs, output_dir)
+                if (
+                    payload["kind"] == "discrete"
+                    and payload["solver"] == "qaoa"
+                    and row.get("success")
+                    and pd.notna(row.get("btc_weight"))
+                ):
+                    landmarks["qaoa_discrete_btc"] = float(row["btc_weight"])
+
+            def _on_error(payload: dict, exc: Exception) -> None:
+                # Don't swallow — surface to the log AND record a failed row so
+                # the comparison_summary always carries every requested task.
+                msg = f"{type(exc).__name__}: {exc}"
+                log.error(
+                    "[parallel] worker for %s/%s raised: %s",
+                    payload["kind"], payload["solver"], msg,
+                )
+                method = (
+                    "Quantum Binary Selection" if payload["kind"] == "binary"
+                    else "Quantum Discrete Weights"
+                )
+                rows.append({
+                    "method": method,
+                    "solver": payload["solver"],
+                    "btc_weight": float("nan"),
+                    "bnb_weight": float("nan"),
+                    "annual_return": float("nan"),
+                    "annual_volatility": float("nan"),
+                    "sharpe_ratio": float("nan"),
+                    "sortino_ratio": float("nan"),
+                    "max_drawdown": float("nan"),
+                    "var_95": float("nan"),
+                    "cvar_95": float("nan"),
+                    "objective": float("nan"),
+                    "final_cumulative_return": float("nan"),
+                    "runtime_seconds": float("nan"),
+                    "success": False,
+                    "error_message": f"worker raised {msg}",
+                    "note": "",
+                })
+                _flush_summary(rows, output_dir)
+
+            # Dispatch: parallel pool when it's worth it, in-process loop otherwise.
+            if not payloads:
+                log.info("[parallel] no quantum tasks to run")
+            elif workers <= 1 or len(payloads) == 1:
+                reason = (
+                    "workers=1 (sequential)" if workers <= 1
+                    else "only 1 task, no point spawning a pool"
+                )
+                print(f"[parallel] running {len(payloads)} task(s) in-process: {reason}", flush=True)
+                for payload in payloads:
+                    try:
+                        result = quantum_worker(payload)
+                    except Exception as e:  # noqa: BLE001
+                        _on_error(payload, e)
+                    else:
+                        _on_result(payload, result)
+            else:
+                run_quantum_parallel(
+                    payloads=payloads,
+                    workers=workers,
+                    on_result=_on_result,
+                    on_error=_on_error,
+                )
 
     # ---- 5. Plots (last; failure here doesn't lose any data)
     samples_df = pd.concat(samples_dfs, ignore_index=True) if samples_dfs else pd.DataFrame()

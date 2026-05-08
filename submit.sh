@@ -70,20 +70,53 @@ fi
 echo ">>> uv version: $(uv --version)"
 
 ###############################################################################
-# 2. Pin threading to the SLURM allocation. Qiskit-Aer + BLAS otherwise oversubscribe.
+# 2. Threading policy.
+#
+# We use Python *multiprocessing* (one process per allocated core) for the
+# independent quantum solver calls. Each Python worker should therefore use
+# exactly ONE BLAS / OpenMP thread; otherwise N workers × M threads each
+# would oversubscribe the N cores SLURM gave us.
+#
+# Old policy (WRONG with multiprocessing): export OMP=$NCPU. That gave 1
+# Python worker × 4 BLAS threads = 100% of one core most of the time
+# because the work was sequential. Hence the observed 25% efficiency on
+# job 55719.
 ###############################################################################
 NCPU="${SLURM_CPUS_PER_TASK:-1}"
-export OMP_NUM_THREADS="$NCPU"
-export OPENBLAS_NUM_THREADS="$NCPU"
-export MKL_NUM_THREADS="$NCPU"
-export QISKIT_NUM_THREADS="$NCPU"
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
 export PYTHONUNBUFFERED=1
+
+# Echo every variable our parallelism layer reads so the .out file is
+# self-diagnosing.
+echo ">>> environment relevant to parallelism"
+echo "    SLURM_JOB_ID         = ${SLURM_JOB_ID:-(unset)}"
+echo "    SLURM_CPUS_PER_TASK  = ${SLURM_CPUS_PER_TASK:-(unset)}"
+echo "    SLURM_NTASKS         = ${SLURM_NTASKS:-(unset)}"
+echo "    OMP_NUM_THREADS      = $OMP_NUM_THREADS"
+echo "    MKL_NUM_THREADS      = $MKL_NUM_THREADS"
+echo "    OPENBLAS_NUM_THREADS = $OPENBLAS_NUM_THREADS"
+echo "    NUMEXPR_NUM_THREADS  = $NUMEXPR_NUM_THREADS"
+echo "    VECLIB_MAXIMUM_THREADS = $VECLIB_MAXIMUM_THREADS"
+echo "    NCPU (forwarded to --workers) = $NCPU"
 
 ###############################################################################
 # 3. Sync dependencies (creates .venv on first run, no-op afterwards).
 ###############################################################################
 echo ">>> uv sync --all-extras"
 uv sync --all-extras
+
+###############################################################################
+# 3a. Parallel smoke test (verifies multiprocessing actually saturates cores).
+#     If this fails the whole job exits — there is no point running the real
+#     workload if SLURM allocation isn't truly parallel.
+###############################################################################
+echo ""
+echo ">>> parallel smoke test (4 CPU-bound tasks × 25s)"
+uv run python main.py --workers "$NCPU" --parallel-smoke-test
 
 ###############################################################################
 # 4. Unit tests.
@@ -102,6 +135,7 @@ uv run python main.py \
     --end   "${END_DATE:-2025-01-01}" \
     --step  "${GRID_STEP:-0.01}" \
     --objective "${OBJECTIVE:-maximize_sharpe}" \
+    --workers "$NCPU" \
     --output-dir outputs_classical \
     --no-plots
 
@@ -122,6 +156,7 @@ uv run python main.py \
     --qaoa-reps  "${QAOA_REPS:-2}" \
     --qaoa-shots "${QAOA_SHOTS:-2048}" \
     --qaoa-seed  "${QAOA_SEED:-42}" \
+    --workers "$NCPU" \
     --output-dir outputs_quantum \
     --verbose
 
