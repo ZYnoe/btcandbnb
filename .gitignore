@@ -1,0 +1,30 @@
+# uv-managed virtual env (recreated by `uv sync`)
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Outputs from real runs (only outputs/.gitkeep is tracked)
+outputs/*
+!outputs/.gitkeep
+outputs_classical/
+outputs_quantum/
+
+# SLURM job logs
+portfolio-opt-*.out
+portfolio-opt-*.err
+slurm-*.out
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

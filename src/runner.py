@@ -1,0 +1,295 @@
+"""Top-level orchestration: download data → classical → quantum → save → plot → print."""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from . import _qiskit_compat as qc
+from .comparison import (
+    assemble_summary,
+    best_classical_row,
+    best_quantum_row,
+    save_summary,
+)
+from .config import Config
+from .data import compute_market_data, MarketData
+from .optimizer import evaluate_benchmarks, grid_search, mean_variance_optimize
+from .plots import make_all_plots
+from .quantum_binary import solve_binary
+from .quantum_discrete_weights import build_candidates, solve_discrete
+from .utils import ensure_dir, set_random_seed, setup_logger, to_jsonable
+
+RISK_DISCLAIMER = (
+    "RISK NOTICE — please read carefully:\n"
+    "  1. Past returns do NOT predict future results.\n"
+    "  2. Crypto assets are extremely volatile and can lose value rapidly.\n"
+    "  3. Quantum algorithms here only solve the QUBO under the given mu/Sigma; "
+    "they do not forecast prices.\n"
+    "  4. This tool is for research/education only and is NOT investment advice."
+)
+
+
+def _quantum_solvers_for(config: Config) -> list[str]:
+    if config.quantum_solver == "all":
+        return ["exact", "qaoa", "sampling_vqe"]
+    return [config.quantum_solver]
+
+
+def _run_quantum(
+    config: Config,
+    market: MarketData,
+    log: logging.Logger,
+) -> tuple[list[dict], pd.DataFrame, pd.DataFrame, dict[str, float | None]]:
+    """Run all enabled quantum solvers; collect rows + samples + candidates df.
+
+    Returns:
+        rows: list of result dicts (one per (mode, solver) combination).
+        candidates_df: pre-evaluated discrete candidates (empty if discrete disabled).
+        samples_df: top-k QAOA/SamplingVQE samples (empty if no approx solver ran).
+        landmarks: best btc weights for plotting (classical_grid, qaoa_discrete).
+    """
+    rows: list[dict] = []
+    samples_all: list[pd.DataFrame] = []
+    candidates_df = pd.DataFrame()
+    landmarks: dict[str, float | None] = {"qaoa_discrete_btc": None}
+
+    if not config.use_quantum:
+        return rows, candidates_df, pd.DataFrame(), landmarks
+
+    if not qc.QISKIT_AVAILABLE:
+        log.warning(
+            "Qiskit is not importable; skipping quantum runs. Install qiskit + qiskit-optimization "
+            "+ qiskit-algorithms (and qiskit-aer for QAOA shots) to enable."
+        )
+        return rows, candidates_df, pd.DataFrame(), landmarks
+
+    log.info("Qiskit availability: %s", qc.availability_summary())
+
+    do_binary = config.quantum_mode in ("binary", "both")
+    do_discrete = config.quantum_mode in ("discrete", "both")
+    solvers = _quantum_solvers_for(config)
+
+    if do_binary:
+        for solver in solvers:
+            if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
+                log.info("Skipping binary sampling_vqe — not available in installed Qiskit.")
+                continue
+            log.info("Running quantum binary selection [%s]...", solver)
+            row = solve_binary(
+                market.returns, market.mu, market.Sigma,
+                solver=solver,
+                risk_aversion=config.risk_aversion,
+                risk_free_rate=config.risk_free_rate,
+                budget=config.binary_budget,
+                no_budget_constraint=config.no_budget_constraint,
+                qaoa_reps=config.qaoa_reps,
+                qaoa_shots=config.qaoa_shots,
+                qaoa_seed=config.qaoa_seed,
+            )
+            rows.append(row)
+
+    if do_discrete:
+        candidates_df = build_candidates(
+            market.mu, market.Sigma, market.returns,
+            weight_step=config.quantum_weight_step,
+            risk_aversion=config.risk_aversion,
+            risk_free_rate=config.risk_free_rate,
+        )
+        log.info(
+            "Built %d candidate weights with step=%.4f for discrete-weight QUBO.",
+            len(candidates_df), config.quantum_weight_step,
+        )
+        for solver in solvers:
+            if solver == "sampling_vqe" and not qc.SAMPLING_VQE_AVAILABLE:
+                log.info("Skipping discrete sampling_vqe — not available in installed Qiskit.")
+                continue
+            log.info("Running quantum discrete weights [%s]...", solver)
+            row, samples = solve_discrete(
+                market.returns, market.mu, market.Sigma, candidates_df,
+                solver=solver,
+                risk_aversion=config.risk_aversion,
+                risk_free_rate=config.risk_free_rate,
+                qaoa_reps=config.qaoa_reps,
+                qaoa_shots=config.qaoa_shots,
+                qaoa_seed=config.qaoa_seed,
+            )
+            rows.append(row)
+            if not samples.empty:
+                samples_all.append(samples)
+            if solver == "qaoa" and row.get("success") and pd.notna(row.get("btc_weight")):
+                landmarks["qaoa_discrete_btc"] = float(row["btc_weight"])
+
+    samples_df = pd.concat(samples_all, ignore_index=True) if samples_all else pd.DataFrame()
+    return rows, candidates_df, samples_df, landmarks
+
+
+def _print_summary(market: MarketData, summary: pd.DataFrame, output_dir: Path, log: logging.Logger) -> None:
+    sep = "=" * 72
+    print()
+    print(sep)
+    print("PORTFOLIO OPTIMIZATION — RESULT SUMMARY")
+    print(sep)
+    print(f"Data window : {market.returns.index.min().date()} → {market.returns.index.max().date()}")
+    print(f"Tickers     : {', '.join(market.tickers)}")
+    print(f"Annualization factor: {market.annualization_factor}")
+    print(f"Rows used   : {len(market.returns)}")
+    print()
+    print("Annualized stats per asset:")
+    for t, mu_v, vol_v in zip(market.tickers, market.mu, market.vol):
+        print(f"  {t}: mu = {mu_v:+.4f}    vol = {vol_v:.4f}")
+    print(f"  correlation BTC↔BNB: {market.corr[0, 1]:+.4f}")
+    print()
+
+    classic = best_classical_row(summary)
+    quantum = best_quantum_row(summary)
+
+    if classic is not None:
+        print(f"Classical optimum : {classic['method']} ({classic['solver']})")
+        print(f"  weights          : BTC {classic['btc_weight']:.4f}  /  BNB {classic['bnb_weight']:.4f}")
+        print(f"  Sharpe / Vol     : {classic['sharpe_ratio']:.4f}  /  {classic['annual_volatility']:.4f}")
+        print(f"  Annual return    : {classic['annual_return']:+.4f}")
+        print(f"  Max drawdown     : {classic['max_drawdown']:+.4f}")
+    else:
+        print("Classical optimum : (none — no successful classical row)")
+    print()
+
+    if quantum is not None:
+        print(f"Quantum optimum   : {quantum['method']} ({quantum['solver']})")
+        print(f"  weights          : BTC {quantum['btc_weight']}  /  BNB {quantum['bnb_weight']}")
+        print(f"  Sharpe / Vol     : {quantum['sharpe_ratio']}  /  {quantum['annual_volatility']}")
+        print(f"  note             : {quantum.get('note', '')}")
+    else:
+        print("Quantum optimum   : (no successful quantum row — see comparison_summary.csv)")
+    print()
+
+    benchmarks = summary[summary["method"].str.startswith("Benchmark", na=False)]
+    if not benchmarks.empty:
+        print("Benchmarks:")
+        for _, row in benchmarks.iterrows():
+            print(
+                f"  {row['method']:<22} BTC={row['btc_weight']:.2f} "
+                f"Sharpe={row['sharpe_ratio']:.4f}  "
+                f"AnnRet={row['annual_return']:+.4f}  MaxDD={row['max_drawdown']:+.4f}"
+            )
+    print()
+    print(f"Outputs saved to: {output_dir.resolve()}")
+    print()
+    print(RISK_DISCLAIMER)
+    print(sep)
+
+
+def run(config: Config) -> int:
+    """End-to-end. Returns shell-style exit code."""
+    config.validate()
+    log = setup_logger(config.verbose)
+    set_random_seed(config.qaoa_seed)
+    output_dir = ensure_dir(config.output_path)
+
+    log.info("Downloading market data for %s ...", ", ".join(config.tickers))
+    try:
+        market = compute_market_data(
+            tuple(config.tickers),
+            start=config.start, end=config.end,
+            frequency=config.frequency,
+            annualization_factor=config.annualization_factor,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("Data download failed: %s", e)
+        return 2
+
+    if config.save_intermediate:
+        market.prices.to_csv(output_dir / "prices.csv")
+        market.returns.to_csv(output_dir / "returns.csv")
+
+    with open(output_dir / "basic_stats.json", "w", encoding="utf-8") as fh:
+        json.dump(to_jsonable(market.basic_stats()), fh, indent=2, ensure_ascii=False)
+
+    log.info("Running classical grid search...")
+    grid, classic_grid_row = grid_search(
+        market.returns, market.mu, market.Sigma,
+        step=config.step,
+        objective=config.objective,
+        risk_free_rate=config.risk_free_rate,
+        risk_aversion=config.risk_aversion,
+        max_drawdown=config.max_drawdown,
+    )
+    grid.to_csv(output_dir / "grid_search_results.csv", index=False)
+
+    log.info("Running mean-variance optimization...")
+    mv_row = mean_variance_optimize(
+        market.returns, market.mu, market.Sigma,
+        objective=config.objective,
+        risk_free_rate=config.risk_free_rate,
+        risk_aversion=config.risk_aversion,
+    )
+
+    log.info("Evaluating benchmarks...")
+    benchmark_rows = evaluate_benchmarks(
+        market.returns, market.mu, market.Sigma,
+        risk_free_rate=config.risk_free_rate,
+        risk_aversion=config.risk_aversion,
+    )
+
+    quantum_rows, candidates_df, samples_df, landmarks = _run_quantum(config, market, log)
+    if not candidates_df.empty:
+        candidates_df.to_csv(output_dir / "quantum_discrete_weight_results.csv", index=False)
+    if not samples_df.empty:
+        samples_df.to_csv(output_dir / "quantum_samples.csv", index=False)
+    elif (output_dir / "quantum_samples.csv").exists() is False:
+        # always create an empty placeholder for stable schema
+        pd.DataFrame(
+            columns=["solver", "bitstring", "selected_weight_index", "btc_weight", "objective", "probability"]
+        ).to_csv(output_dir / "quantum_samples.csv", index=False)
+
+    all_rows = [classic_grid_row, mv_row, *quantum_rows, *benchmark_rows]
+    summary = assemble_summary(all_rows)
+    save_summary(summary, output_dir)
+
+    optimized_selections: list[tuple[str, np.ndarray]] = []
+    classic_best = best_classical_row(summary)
+    if classic_best is not None and pd.notna(classic_best["btc_weight"]):
+        optimized_selections.append((
+            f"Classical best ({classic_best['method']})",
+            np.array([classic_best["btc_weight"], classic_best["bnb_weight"]], dtype=float),
+        ))
+    if quantum_rows:
+        # pick best successful quantum discrete row for the cumulative chart
+        q_disc = [
+            r for r in quantum_rows
+            if r.get("success")
+            and r.get("method", "").startswith("Quantum Discrete")
+            and pd.notna(r.get("btc_weight"))
+        ]
+        if q_disc:
+            best_q = max(q_disc, key=lambda r: r.get("sharpe_ratio") or float("-inf"))
+            optimized_selections.append((
+                f"Quantum discrete best ({best_q['solver']})",
+                np.array([best_q["btc_weight"], best_q["bnb_weight"]], dtype=float),
+            ))
+    optimized_selections.extend([
+        ("Benchmark 100% BTC", np.array([1.0, 0.0])),
+        ("Benchmark 100% BNB", np.array([0.0, 1.0])),
+        ("Benchmark 50/50", np.array([0.5, 0.5])),
+    ])
+
+    if not config.no_plots:
+        log.info("Rendering plots...")
+        make_all_plots(
+            market=market,
+            grid=grid,
+            summary=summary,
+            quantum_samples=samples_df,
+            candidates=candidates_df if not candidates_df.empty else None,
+            classical_grid_btc=float(classic_grid_row["btc_weight"]),
+            quantum_qaoa_btc=landmarks.get("qaoa_discrete_btc"),
+            optimized_selections=optimized_selections,
+            output_dir=output_dir,
+        )
+
+    _print_summary(market, summary, Path(output_dir), log)
+    return 0
