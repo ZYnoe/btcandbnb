@@ -202,6 +202,28 @@ if fail_silent:
 print("OK: every failed row carries an error_message; comparison_summary.csv is well-formed.")
 PY
 
+###############################################################################
+# 8. Julia classical comparison (independent branch — see julia/ subproject).
+#    Runs grid + Optim.jl + JuMP+Ipopt against the SAME μ/Σ written above.
+#    Doesn't block the job exit code: a Julia failure is logged but doesn't
+#    invalidate the Python comparison_summary.csv that's already on disk.
+###############################################################################
+if command -v julia >/dev/null 2>&1; then
+    echo ""
+    echo ">>> Julia classical run (grid + Optim.jl + JuMP+Ipopt)"
+    julia --project=julia -e 'using Pkg; Pkg.instantiate()'
+    julia --project=julia julia/test/runtests.jl || \
+        echo "WARN: julia tests failed; continuing"
+    julia --project=julia julia/run.jl --outputs outputs_quantum/ || \
+        echo "WARN: julia run.jl failed; Python comparison_summary.csv is unaffected"
+    echo ""
+    echo ">>> re-running analyze.py so the report includes Julia rows"
+    uv run python analyze.py outputs_quantum/ || true
+else
+    echo ""
+    echo "WARN: 'julia' not on PATH; skipping Julia classical comparison"
+fi
+
 echo ""
 echo "============================================================"
 echo "  job done: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

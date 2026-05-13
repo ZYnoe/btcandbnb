@@ -158,9 +158,12 @@ def run(config: Config) -> int:
         log.error("Data download failed: %s", e)
         return 2
 
+    # returns.csv is always dumped — the Julia subproject (julia/run.jl) reads
+    # it to share μ/Σ-aligned daily returns with the Python pipeline
+    # (Invariant 1). prices.csv stays opt-in to avoid clutter.
+    market.returns.to_csv(output_dir / "returns.csv")
     if config.save_intermediate:
         market.prices.to_csv(output_dir / "prices.csv")
-        market.returns.to_csv(output_dir / "returns.csv")
 
     with open(output_dir / "basic_stats.json", "w", encoding="utf-8") as fh:
         json.dump(to_jsonable(market.basic_stats()), fh, indent=2, ensure_ascii=False)

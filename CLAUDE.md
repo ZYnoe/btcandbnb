@@ -34,9 +34,14 @@ and creates `.venv/` here.
 
 ```bash
 uv sync --all-extras                       # install (first run ~2 min)
-uv run pytest tests -v                     # 19 tests, ~6 s
+uv run pytest tests -v                     # 20 tests, ~6 s (19 + 1 Julia parity, auto-skips if no julia)
 uv run python main.py --use-quantum        # full classical+quantum end-to-end
 uv run python analyze.py outputs/          # post-run Markdown report + plot
+
+# Optional Julia classical comparison (see "Julia subproject" below):
+julia --project=julia -e 'using Pkg; Pkg.instantiate()'   # one-time
+julia --project=julia julia/run.jl --outputs outputs/     # adds Classic Julia rows
+uv run python analyze.py outputs/                          # re-run to merge them
 ```
 
 Never use system `pip` / `python3`. Never write `requirements.txt`
@@ -66,10 +71,37 @@ manifests" — feedback memory).
 
 - `main.py` — argparse → `Config` → `run`. Stays thin.
 - `analyze.py` — Markdown report + verdict plot from any outputs/ dir.
+  Merges `comparison_summary_julia.csv` if present.
 - `submit.sh` — SLURM job; runs smoke test, pytest, classical-only,
-  then full classical+quantum, then a validation Python snippet.
+  then full classical+quantum, then a validation Python snippet,
+  then the Julia classical comparison (best-effort).
 - `pyproject.toml` + `uv.lock` — uv-managed deps.
-- `tests/` — 4 files, 19 tests. Quantum tests `pytest.importorskip`.
+- `tests/` — 5 files, 20 tests. Quantum tests `pytest.importorskip`;
+  `test_julia_parity.py` skips if `julia` is missing.
+
+### `julia/` (parallel classical implementation)
+
+Standalone Julia subproject that mirrors the **classical** side of
+`src/optimizer.py` (grid + Mean-Variance + benchmarks) — see
+`.claude/skills/julia-subproject.md` for the design and rationale.
+The quantum side stays Python-only.
+
+| File | Role | Notes |
+|---|---|---|
+| `julia/Project.toml` + `julia/Manifest.toml` | env-only project; Manifest is committed (same policy as `uv.lock`) | deps: JuMP, Ipopt, Optim, DataFrames, CSV, JSON3 |
+| `julia/src/Metrics.jl` | Risk/return indicators | bit-identical to `src/metrics.py` on real data; `VOL_EPSILON=1e-12` handles Julia's nonzero `std` on constant input |
+| `julia/src/MarketData.jl` | Reads `basic_stats.json` + `returns.csv` | Invariant 1: Julia never recomputes μ/Σ |
+| `julia/src/Optimizer.jl` | Grid + two MV solvers + benchmarks | N-generic in design, schema currently N=2 |
+| `julia/src/Output.jl` | Row schema + incremental CSV flush | `COLUMNS` mirrors `src/comparison.py::COLUMNS` exactly; schema-parity test enforces this |
+| `julia/src/PortfolioOptimizer.jl` | Wrapper module that `include`s the four siblings | one entry point for run.jl + tests |
+| `julia/run.jl` | CLI entrypoint | `julia --project=julia julia/run.jl --outputs <dir>` |
+| `julia/test/runtests.jl` | Test entry | 56 tests; `julia --project=julia julia/test/runtests.jl` |
+
+**Two Mean-Variance solvers run side-by-side**: `Optim.jl LBFGS+softmax`
+(softmax reparameterization for sum-to-1 + nonneg) and `JuMP + Ipopt`
+(direct constraint formulation, closer to SLSQP semantics). On the
+default 2024–2026 BTC/BNB window they agree with each other and with
+Python SLSQP to ~5 decimals.
 
 ## Load-bearing invariants (do NOT break)
 
@@ -98,7 +130,16 @@ manifests" — feedback memory).
    in priority order.
 
 6. **Risk disclaimer.** Every CLI run + every Markdown report ends
-   with the 4-line risk notice. Never weaken this.
+   with the 4-line risk notice. Never weaken this. Julia entrypoint
+   prints the same disclaimer (mirrored in `julia/run.jl::RISK_DISCLAIMER`).
+
+7. **Julia reads, never recomputes.** `julia/src/MarketData.jl` reads
+   `basic_stats.json` + `returns.csv` written by Python. It must NEVER
+   call yfinance or compute μ/Σ from raw prices — that would break
+   Invariant 1 with subtle precision differences. Same goes for
+   `comparison_summary_julia.csv` row schema, which mirrors
+   `src/comparison.py::COLUMNS` exactly; `tests/test_julia_parity.py`
+   + `julia/test/test_schema.jl` enforce this.
 
 ## Known traps & how they're handled
 
@@ -110,6 +151,8 @@ manifests" — feedback memory).
 | yfinance `auto_adjust` flipped | Missing `Adj Close` column | Pass `auto_adjust=False`, fall back to `Close` |
 | Spawn vs fork on Linux | qiskit-aer C++ globals corrupt under fork | `mp.get_context("spawn")` — eats ~5 s import per worker but is reproducible |
 | QAOA on 21 qubits + reps=2 | Single solver runs minutes; SLURM 30-min timeout | `QUANTUM_WEIGHT_STEP=0.1` cuts 21 qubits to 11 (~50× faster) |
+| Julia `std([0.01,…,0.01]; corrected=true)` ≈ 1.8e-18, not 0 | Sharpe on constant returns didn't return NaN | `Metrics.VOL_EPSILON = 1e-12`; Python NumPy returns exact 0 |
+| Julia first-time precompile | ~30s before run.jl produces any output | One-time cost; sysimage via PackageCompiler.jl deferred |
 
 ## Testing
 
@@ -118,9 +161,16 @@ manifests" — feedback memory).
 - Grid + MV + benchmarks
 - Quantum: candidate count, one-hot constraint, exact ≡ grid
 - Binary: budget=1 → 1 selected, budget=2 → both selected
+- **Cross-language parity** (`test_julia_parity.py`): Julia grid at step=s
+  must equal Python grid at the same step on the same μ/Σ. Skips
+  automatically if `julia` is not on PATH.
 
 Quantum tests use `pytest.importorskip("qiskit_optimization")` so
 they auto-skip on machines without qiskit.
+
+Julia tests: `julia --project=julia julia/test/runtests.jl` covers
+metrics parity (against Python expected values hardcoded), optimizer
+correctness, and schema parity with `src/comparison.py::COLUMNS`.
 
 ## SLURM workflow (Yonsei cluster)
 

@@ -48,7 +48,17 @@ def _load(outputs: Path) -> dict:
     out = {"path": outputs}
 
     p = outputs / "comparison_summary.csv"
-    out["summary"] = pd.read_csv(p) if p.exists() else None
+    summary = pd.read_csv(p) if p.exists() else None
+
+    # If a Julia run wrote alongside the Python pipeline, concatenate its
+    # rows so they appear in every section that iterates summary rows.
+    # Schema must already match (julia/src/Output.jl::COLUMNS mirrors
+    # src/comparison.py::COLUMNS).
+    p_julia = outputs / "comparison_summary_julia.csv"
+    if p_julia.exists():
+        julia_df = pd.read_csv(p_julia)
+        summary = pd.concat([summary, julia_df], ignore_index=True) if summary is not None else julia_df
+    out["summary"] = summary
 
     p = outputs / "basic_stats.json"
     out["stats"] = json.loads(p.read_text()) if p.exists() else None
